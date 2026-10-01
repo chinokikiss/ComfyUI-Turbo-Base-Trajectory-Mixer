@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import unittest
+import weakref
 from unittest.mock import patch
 
 import torch
@@ -266,6 +267,79 @@ class MixerTests(unittest.TestCase):
             self.assertAlmostEqual(actual, expected, places=5)
         self.assertEqual(len(weights), 4)
         self.assertFalse(mixed.hook_backup)
+
+    def test_cpu_delta_is_computed_once_reused_and_released_per_sampling(self):
+        mixed = mixed_model(tiny_model(), lora_smooth_steps=4.0)
+        original_patches = mixed.hook_patches
+        delta_refs = []
+        original_cache = mixer.cache_lora_deltas
+        def inspect_cache(model, hooks):
+            cached = original_cache(model, hooks)
+            for patches in cached.values():
+                for entries in patches.values():
+                    for entry in entries:
+                        delta = entry[1][1][0]
+                        self.assertEqual(delta.device.type, "cpu")
+                        self.assertEqual(delta.dtype, torch.float32)
+                        delta_refs.append(weakref.ref(delta))
+            return cached
+        original_calculate = mixer.LoRAAdapter.calculate_weight
+        calls = []
+        def compute(adapter, weight, *args, **kwargs):
+            calls.append((weight.device.type, weight.dtype))
+            return original_calculate(adapter, weight, *args, **kwargs)
+        with patch.object(mixer, "cache_lora_deltas", side_effect=inspect_cache):
+            with patch.object(mixer.LoRAAdapter, "calculate_weight", new=compute):
+                first, _ = sample(mixed)
+                self.assertEqual(len(calls), 1)
+                self.assertIs(mixed.hook_patches, original_patches)
+                self.assertTrue(all(ref() is None for ref in delta_refs))
+                second, _ = sample(mixed)
+                self.assertEqual(len(calls), 2)
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+        self.assertTrue(all(ref() is None for ref in delta_refs))
+        with patch.object(mixer, "cache_lora_deltas") as cache:
+            sample(mixed_model(tiny_model()))
+            cache.assert_not_called()
+
+    def test_cached_delta_preserves_alpha_strength_offset_and_patch_function(self):
+        base = tiny_model()
+        adapter = mixer.LoRAAdapter(set(), (torch.tensor([[0.7]]), torch.tensor([[0.3, -0.2]]), 2.0, None, None, None))
+        hook = comfy.hooks.WeightHook()
+        hooks = comfy.hooks.HookGroup()
+        hooks.add(hook)
+        original = (-0.7, adapter, 0.8, (0, 1, 1), lambda value: value * 1.5)
+        base.hook_patches[hook.hook_ref] = {"diffusion_model.proj.weight": [original]}
+        cached = mixer.cache_lora_deltas(base, hooks)[hook.hook_ref]["diffusion_model.proj.weight"][0]
+        for scale in (0.0, 0.2, 0.5, 1.0):
+            native = comfy.lora.calculate_weight([(original[0] * scale, *original[1:])], torch.ones(2, 2), "weight")
+            reused = comfy.lora.calculate_weight([(cached[0] * scale, *cached[1:])], torch.ones(2, 2), "weight")
+            torch.testing.assert_close(native, reused)
+        dora = mixer.LoRAAdapter(set(), (*adapter.weights[:4], torch.ones(1), None))
+        dora_patch = (1.0, dora, 1.0, None, None)
+        base.hook_patches[hook.hook_ref]["diffusion_model.proj.weight"] = [dora_patch]
+        preserved = mixer.cache_lora_deltas(base, hooks)[hook.hook_ref]["diffusion_model.proj.weight"][0]
+        self.assertIs(preserved, dora_patch)
+
+    def test_delta_cache_restores_main_and_multigpu_clone_on_exception(self):
+        mixed = mixed_model(tiny_model(), lora_smooth_steps=2.0)
+        clone = mixed.clone()
+        mixed.set_additional_models("multigpu", [clone])
+        originals = mixed.hook_patches
+        hook = mixed.get_attachment(mixer.MIXER_KEY).hooks[0]
+        delta_refs = []
+        def fail(noise, latent, sampler, sigmas):
+            clone.hook_patches = comfy.model_patcher.create_hook_patches_clone(mixed.hook_patches)
+            delta_refs.append(weakref.ref(clone.hook_patches[hook.hook_ref]["diffusion_model.proj.weight"][0][1][1][0]))
+            raise RuntimeError("cache interruption")
+        guider = comfy.samplers.CFGGuider(mixed)
+        wrapper = mixed.get_wrappers(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, mixer.MIXER_KEY)[0]
+        executor = comfy.patcher_extension.WrapperExecutor.new_class_executor(fail, guider, [wrapper])
+        with self.assertRaisesRegex(RuntimeError, "cache interruption"):
+            executor.execute(None, None, None, SIGMAS)
+        self.assertIs(mixed.hook_patches, originals)
+        self.assertIs(clone.hook_patches[hook.hook_ref], originals[hook.hook_ref])
+        self.assertTrue(all(ref() is None for ref in delta_refs))
 
 
 if __name__ == "__main__":
