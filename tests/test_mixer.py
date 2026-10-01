@@ -62,17 +62,17 @@ def scheme(mode=mixer.BASE_BASE, **ratios):
     return {"scheme": mode, "prefix_ratio": 0.5, "suffix_ratio": 0.5, "composition_ratio": 0.5} | ratios
 
 
-def mixed_model(base, selection=None):
+def mixed_model(base, selection=None, lora_smooth_steps=0.0):
     mixed, _, hooks = comfy.hooks.load_hook_lora_for_models(base, None, LORA, 1.0, 0.0)
-    return mixer.attach_mixer(mixed, hooks, selection or scheme(), 1.0)
+    return mixer.attach_mixer(mixed, hooks, selection or scheme(), 1.0, lora_smooth_steps)
 
 
-def sample(model, sigmas=SIGMAS, sampler_name="euler", positive=POSITIVE, negative=NEGATIVE, callback=None, mask=None):
+def sample(model, sigmas=SIGMAS, sampler_name="euler", positive=POSITIVE, negative=NEGATIVE, callback=None, mask=None, sampler=None):
     guider = comfy.samplers.CFGGuider(model)
     guider.set_conds(positive, negative)
     guider.set_cfg(4.0)
     noise = torch.full((1, 16, 1, 2, 2), 3.0)
-    output = guider.sample(noise, torch.zeros_like(noise), comfy.samplers.ksampler(sampler_name), sigmas,
+    output = guider.sample(noise, torch.zeros_like(noise), sampler or comfy.samplers.ksampler(sampler_name), sigmas,
                            denoise_mask=mask, callback=callback, disable_pbar=True, seed=0)
     return output, guider
 
@@ -198,7 +198,7 @@ class MixerTests(unittest.TestCase):
         self.assertTrue(asyncio.run(host_nodes.load_custom_node(str(ROOT))))
         node = host_nodes.NODE_CLASS_MAPPINGS["TurboBaseTrajectoryMixer"]
         schema = node.define_schema()
-        selector = schema.inputs[-1]
+        selector = schema.inputs[-2]
         self.assertEqual([len(option.inputs) for option in selector.options], [2, 1, 1, 2])
         for option in selector.options:
             self.assertTrue(all(widget.display_mode == mixer.io.NumberDisplay.slider for widget in option.inputs))
@@ -208,6 +208,64 @@ class MixerTests(unittest.TestCase):
             nested = internal_io.build_nested_inputs(live_inputs, v3_data)
             self.assertEqual(nested["scheme"]["scheme"], option.key)
             self.assertTrue(all(nested["scheme"][widget.id] == 0.5 for widget in option.inputs))
+
+    def test_smoothing_changes_real_lora_weights_and_preserves_cfg(self):
+        base = tiny_model()
+        mixed = mixed_model(base, lora_smooth_steps=2.0)
+        result, _ = sample(mixed)
+        expected = [(1.0, 2)] * 3 + [(1.5, 1)] + [(2.0, 1)] * 5 + [(1.5, 2)] + [(1.0, 2)] * 2
+        self.assertEqual(base.model.diffusion_model.seen, expected)
+        expected_raw = torch.full_like(result, 3.0 - sum(weight + (4 if branches == 2 else 1) for weight, branches in expected) / 12)
+        torch.testing.assert_close(result, base.model.process_latent_out(expected_raw))
+        again, _ = sample(mixed)
+        torch.testing.assert_close(result, again, rtol=0, atol=0)
+        self.assertFalse(mixed.hook_backup)
+        self.assertFalse(mixed.cached_hook_patches)
+        torch.testing.assert_close(base.model.diffusion_model.proj.weight, torch.ones(2, 2))
+
+    def test_smooth_curve_continuity_short_segments_and_pure_modes(self):
+        for before, after in ((False, True), (True, False)):
+            cuts, roles = [6], [before, after]
+            self.assertEqual(mixer.lora_weight(4, cuts, roles, 4, 12), float(before))
+            self.assertEqual(mixer.lora_weight(8, cuts, roles, 4, 12), float(after))
+            self.assertEqual(mixer.lora_weight(6, cuts, roles, 4, 12), 0.5)
+            self.assertAlmostEqual(mixer.lora_weight(5, cuts, roles, 4, 12), 0.15625 if after else 0.84375)
+        self.assertEqual(mixer.lora_weight(1.5, [1, 2], [False, True, False], 32, 4), 1.0)
+        for role in (False, True):
+            for progress in (0, 0.5, 4, 12):
+                self.assertEqual(mixer.lora_weight(progress, [], [role], 32, 12), float(role))
+
+    def test_smoothing_preserves_other_hooks_and_restores_after_interruption(self):
+        base = tiny_model()
+        other, _, hooks = comfy.hooks.load_hook_lora_for_models(base, None, LORA, 0.5, 0.0)
+        positive = comfy.hooks.set_hooks_for_conditioning(POSITIVE, hooks)
+        negative = comfy.hooks.set_hooks_for_conditioning(NEGATIVE, hooks)
+        mixed = mixed_model(other, lora_smooth_steps=2.0)
+        sample(mixed, positive=positive, negative=negative)
+        self.assertEqual(base.model.diffusion_model.seen[3], (2.0, 1))
+        self.assertEqual(base.model.diffusion_model.seen[4], (2.5, 1))
+        def interrupt(step, denoised, x, total):
+            if step == 3:
+                raise RuntimeError("smooth interruption")
+        with self.assertRaisesRegex(RuntimeError, "smooth interruption"):
+            sample(mixed, callback=interrupt)
+        self.assertFalse(mixed.hook_backup)
+        torch.testing.assert_close(base.model.diffusion_model.proj.weight, torch.ones(2, 2))
+
+    def test_smooth_strength_at_intermediate_and_revisited_sigmas(self):
+        base = tiny_model()
+        mixed = mixed_model(base, lora_smooth_steps=2.0)
+        midpoint = (float(SIGMAS[2]) + float(SIGMAS[3])) / 2
+        def probe(model, x, sigmas, extra_args=None, callback=None, disable=None):
+            for sigma in (midpoint, float(SIGMAS[3]), float(SIGMAS[4]), midpoint):
+                model(x, x.new_full((x.shape[0],), sigma), **extra_args)
+            return x
+        sample(mixed, sampler=comfy.samplers.KSAMPLER(probe))
+        weights = [weight for weight, _ in base.model.diffusion_model.seen]
+        for actual, expected in zip(weights, (1.15625, 1.5, 2.0, 1.15625)):
+            self.assertAlmostEqual(actual, expected, places=5)
+        self.assertEqual(len(weights), 4)
+        self.assertFalse(mixed.hook_backup)
 
 
 if __name__ == "__main__":

@@ -33,11 +33,40 @@ def trajectory_steps(steps, scheme):
     return [composition] * prefix + [not composition] * (steps - prefix - suffix) + [style] * suffix
 
 
+def lora_weight(progress, cuts, segment_roles, smooth_steps, total_steps):
+    for i, cut in enumerate(cuts):
+        previous = cuts[i - 1] if i else 0
+        following = cuts[i + 1] if i + 1 < len(cuts) else total_steps
+        half_width = min(smooth_steps, cut - previous, following - cut) / 2
+        if half_width > 0 and cut - half_width < progress < cut + half_width:
+            blend = (progress - cut + half_width) / (2 * half_width)
+            blend = blend * blend * (3 - 2 * blend)
+            return float(segment_roles[i]) + (float(segment_roles[i + 1]) - float(segment_roles[i])) * blend
+    return float(segment_roles[bisect_right(cuts, progress)])
+
+
+class StrengthKeyframes(comfy.hooks.HookKeyframeGroup):
+    def __init__(self):
+        super().__init__()
+        self.value = 1.0
+        self.previous = 1.0
+
+    @property
+    def strength(self):
+        return self.value
+
+    def prepare_current_keyframe(self, curr_t, transformer_options):
+        changed = self.value != self.previous
+        self.previous = self.value
+        return changed
+
+
 class TrajectoryHook:
-    def __init__(self, hooks, scheme, turbo_cfg):
+    def __init__(self, hooks, scheme, turbo_cfg, lora_smooth_steps=0.0):
         self.hooks = hooks
         self.scheme = scheme.copy()
         self.turbo_cfg = turbo_cfg
+        self.lora_smooth_steps = lora_smooth_steps
 
     def register(self, patcher, hooks, target_dict, model_options, registered):
         for hook in self.hooks.hooks:
@@ -47,19 +76,36 @@ class TrajectoryHook:
         guider = executor.class_obj
         roles = trajectory_steps(len(sigmas) - 1, self.scheme)
         sigma_values = sigmas.detach().cpu().tolist()
+        negative_sigmas = [-sigma for sigma in sigma_values]
         cuts = [i for i in range(1, len(roles)) if roles[i] != roles[i - 1]]
         thresholds = [-sigma_values[i] for i in cuts]
         segment_roles = [roles[0]] + [roles[i] for i in cuts] if roles else [False]
         turbo_conds = None
         combined = {}
+        strength = StrengthKeyframes()
+        sample_hooks = self.hooks.clone()
+        for hook in sample_hooks.hooks:
+            hook.hook_keyframe = strength
 
         def predict(pred_executor, x, timestep, model_options, seed=None):
             nonlocal turbo_conds
-            turbo = segment_roles[bisect_right(thresholds, -float(timestep[0]))]
+            sigma = float(timestep[0])
+            turbo = segment_roles[bisect_right(thresholds, -sigma)]
+            weight = float(turbo)
+            if self.lora_smooth_steps > 0 and roles:
+                interval = bisect_right(negative_sigmas, -sigma) - 1
+                if interval < 0:
+                    progress = 0.0
+                elif interval >= len(roles):
+                    progress = float(len(roles))
+                else:
+                    progress = interval + (sigma_values[interval] - sigma) / (sigma_values[interval] - sigma_values[interval + 1])
+                weight = lora_weight(progress, cuts, segment_roles, self.lora_smooth_steps, len(roles))
+            strength.value = weight
             current_guider = pred_executor.class_obj
             original_conds = current_guider.conds
             original_cfg = current_guider.cfg
-            if turbo:
+            if weight > 0:
                 if turbo_conds is None:
                     turbo_conds = {}
                     for name, conds in original_conds.items():
@@ -67,9 +113,10 @@ class TrajectoryHook:
                         for cond in conds:
                             existing = cond.get("hooks")
                             if existing not in combined:
-                                combined[existing] = self.hooks if existing is None else existing.clone_and_combine(self.hooks)
+                                combined[existing] = sample_hooks if existing is None else existing.clone_and_combine(sample_hooks)
                             turbo_conds[name].append(cond | {"hooks": combined[existing]})
                 current_guider.conds = turbo_conds
+            if turbo:
                 current_guider.cfg = self.turbo_cfg
             try:
                 return pred_executor(x, timestep, model_options, seed)
@@ -93,8 +140,8 @@ class TrajectoryHook:
             guider.model_patcher.set_hook_mode(original_hook_mode)
 
 
-def attach_mixer(model, hooks, scheme, turbo_cfg):
-    mixer = TrajectoryHook(hooks, scheme, turbo_cfg)
+def attach_mixer(model, hooks, scheme, turbo_cfg, lora_smooth_steps=0.0):
+    mixer = TrajectoryHook(hooks, scheme, turbo_cfg, lora_smooth_steps)
     previous = model.get_attachment(MIXER_KEY)
     if previous is not None:
         for hook in previous.hooks:
@@ -142,12 +189,15 @@ class TurboBaseTrajectoryMixer(io.ComfyNode):
                     io.DynamicCombo.Option(TURBO_BASE, different_inputs()),
                     io.DynamicCombo.Option(TURBO_TURBO, same_inputs()),
                 ]),
+                io.Float.Input("lora_smooth_steps", optional=True, default=0.0, min=0.0, max=32.0, step=0.5,
+                               display_mode=io.NumberDisplay.slider,
+                               tooltip="LoRA strength transition width in active sampling steps, centered on each switch. 0 keeps hard switching. Neighboring segments limit the width; CFG keeps its segment settings."),
             ],
             outputs=[io.Model.Output()],
         )
 
     @classmethod
-    def execute(cls, model, turbo_lora, lora_strength, turbo_cfg, scheme):
+    def execute(cls, model, turbo_lora, lora_strength, turbo_cfg, scheme, lora_smooth_steps=0.0):
         path = folder_paths.get_full_path_or_raise("loras", turbo_lora)
         lora = comfy.utils.load_torch_file(path, safe_load=True)
         lora = comfy.lora_convert.convert_lora(lora)
@@ -157,4 +207,4 @@ class TurboBaseTrajectoryMixer(io.ComfyNode):
         mixed, _, hooks = comfy.hooks.load_hook_lora_for_models(model, None, lora, lora_strength, 0.0)
         if not any(mixed.hook_patches[hook.hook_ref] for hook in hooks.hooks):
             raise ValueError("The Turbo LoRA contains no compatible diffusion-model weights for this model.")
-        return io.NodeOutput(attach_mixer(mixed, hooks, scheme, turbo_cfg))
+        return io.NodeOutput(attach_mixer(mixed, hooks, scheme, turbo_cfg, lora_smooth_steps))

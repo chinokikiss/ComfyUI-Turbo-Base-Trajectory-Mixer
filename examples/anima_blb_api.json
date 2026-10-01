@@ -9,7 +9,8 @@
       "model": ["1", 0], "turbo_lora": "anima-turbo-lora-v0.2.safetensors",
       "lora_strength": 1.0, "turbo_cfg": 1.0,
       "scheme": "Base composition / Base style",
-      "scheme.prefix_ratio": 0.5, "scheme.suffix_ratio": 0.5
+      "scheme.prefix_ratio": 0.5, "scheme.suffix_ratio": 0.5,
+      "lora_smooth_steps": 0.0
     }
   },
   "3": {
