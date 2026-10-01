@@ -1,15 +1,11 @@
 from bisect import bisect_right
 import math
 
-import torch
-
 import comfy.hooks
-import comfy.lora
 import comfy.lora_convert
 import comfy.model_patcher
 import comfy.patcher_extension
 import comfy.utils
-from comfy.weight_adapter.lora import LoRAAdapter
 import folder_paths
 from comfy_api.latest import io
 
@@ -63,27 +59,6 @@ class StrengthKeyframes(comfy.hooks.HookKeyframeGroup):
         changed = self.value != self.previous
         self.previous = self.value
         return changed
-
-
-def cache_lora_deltas(model, hooks):
-    cached = {}
-    for hook in hooks.hooks:
-        cached[hook.hook_ref] = {}
-        for key, patches in model.hook_patches[hook.hook_ref].items():
-            cached[hook.hook_ref][key] = []
-            for patch in patches:
-                adapter = patch[1]
-                if isinstance(adapter, LoRAAdapter) and adapter.weights[4] is None and adapter.weights[5] is None:
-                    weight, _, convert_func = comfy.model_patcher.get_key_weight(model.model, key)
-                    if convert_func is None:
-                        shape = list(weight.shape)
-                        if patch[3] is not None:
-                            shape[patch[3][0]] = patch[3][2]
-                        delta = torch.zeros(shape, device="cpu", dtype=torch.float32)
-                        delta = comfy.lora.calculate_weight([(1.0, adapter, 1.0, None, None)], delta, key)
-                        patch = (patch[0], ("diff", (delta,)), *patch[2:])
-                cached[hook.hook_ref][key].append(patch)
-    return cached
 
 
 class TrajectoryHook:
@@ -151,8 +126,6 @@ class TrajectoryHook:
 
         original_options = guider.model_options
         original_hook_mode = guider.model_patcher.hook_mode
-        original_hook_patches = guider.model_patcher.hook_patches
-        cache_enabled = self.lora_smooth_steps > 0 and any(roles)
         guider.model_options = comfy.model_patcher.create_model_options_clone(original_options)
         comfy.patcher_extension.add_wrapper_with_key(
             comfy.patcher_extension.WrappersMP.PREDICT_NOISE, MIXER_KEY, predict,
@@ -161,16 +134,8 @@ class TrajectoryHook:
         # Avoid retaining a second model's worth of patched weights between segments.
         guider.model_patcher.set_hook_mode(comfy.hooks.EnumHookMode.MinVram)
         try:
-            if cache_enabled:
-                guider.model_patcher.hook_patches = original_hook_patches | cache_lora_deltas(guider.model_patcher, self.hooks)
             return executor(noise, latent_image, sampler, sigmas, *args, **kwargs)
         finally:
-            # Multigpu clones copy hook patches during sampling preparation.
-            if cache_enabled:
-                for clone in guider.model_patcher.get_additional_models_with_key("multigpu"):
-                    for hook in self.hooks.hooks:
-                        clone.hook_patches[hook.hook_ref] = original_hook_patches[hook.hook_ref]
-            guider.model_patcher.hook_patches = original_hook_patches
             guider.model_options = original_options
             guider.model_patcher.set_hook_mode(original_hook_mode)
 
