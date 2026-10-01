@@ -1,11 +1,16 @@
 from bisect import bisect_right
+from copy import copy
 import math
+
+import torch
 
 import comfy.hooks
 import comfy.lora_convert
 import comfy.model_patcher
 import comfy.patcher_extension
 import comfy.utils
+from comfy.weight_adapter.bypass import BypassForwardHook
+from comfy.weight_adapter.lora import LoRAAdapter
 import folder_paths
 from comfy_api.latest import io
 
@@ -61,6 +66,65 @@ class StrengthKeyframes(comfy.hooks.HookKeyframeGroup):
         return changed
 
 
+class ScheduledLoRABypass(BypassForwardHook):
+    def __init__(self, module, adapter, multiplier, strength, device):
+        super().__init__(module, adapter, multiplier)
+        self.strength = strength
+        self.device = device
+        self.source_weights = adapter.weights
+
+    def _move_adapter_weights_to_device(self, device, dtype=None):
+        super()._move_adapter_weights_to_device(self.device, dtype)
+
+    def _bypass_forward(self, x, *args, **kwargs):
+        multiplier = self.multiplier * self.strength.value
+        if multiplier == 0:
+            return self.original_forward(x, *args, **kwargs)
+        self.adapter.multiplier = multiplier
+        return super()._bypass_forward(x, *args, **kwargs)
+
+    def release(self):
+        self.eject()
+        self.adapter.weights = self.source_weights
+
+
+def make_bypass_injection(model, hooks, strength):
+    # Native injection ejection does not unwind stacked forward wrappers in reverse order.
+    if model.injections:
+        return None, {}
+    patches = []
+    for hook in hooks.hooks:
+        for key, entries in model.hook_patches[hook.hook_ref].items():
+            if not key.endswith(".weight"):
+                return None, {}
+            module = comfy.utils.get_attr(model.model, key[:-7])
+            if not isinstance(module, (torch.nn.Linear, torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)):
+                return None, {}
+            if isinstance(module, (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)) and (module.groups != 1 or module.padding_mode != "zeros"):
+                return None, {}
+            for scale, adapter, model_scale, offset, function in entries:
+                if (not isinstance(adapter, LoRAAdapter) or any(value is not None for value in adapter.weights[3:])
+                        or model_scale != 1 or offset is not None or function is not None):
+                    return None, {}
+                patches.append((key[:-7], adapter, scale))
+    if not patches:
+        return None, {}
+    active = {}
+
+    def inject(patcher):
+        if patcher not in active:
+            active[patcher] = [ScheduledLoRABypass(comfy.utils.get_attr(patcher.model, key), copy(adapter), scale,
+                                                strength, patcher.load_device) for key, adapter, scale in patches]
+        for bypass in active[patcher]:
+            bypass.inject()
+
+    def eject(patcher):
+        for bypass in reversed(active.get(patcher, [])):
+            bypass.eject()
+
+    return comfy.patcher_extension.PatcherInjection(inject, eject), active
+
+
 class TrajectoryHook:
     def __init__(self, hooks, scheme, turbo_cfg, lora_smooth_steps=0.0):
         self.hooks = hooks
@@ -83,6 +147,7 @@ class TrajectoryHook:
         turbo_conds = None
         combined = {}
         strength = StrengthKeyframes()
+        bypass, bypass_hooks = make_bypass_injection(guider.model_patcher, self.hooks, strength) if any(roles) else (None, {})
         sample_hooks = self.hooks.clone()
         for hook in sample_hooks.hooks:
             hook.hook_keyframe = strength
@@ -105,7 +170,7 @@ class TrajectoryHook:
             current_guider = pred_executor.class_obj
             original_conds = current_guider.conds
             original_cfg = current_guider.cfg
-            if weight > 0:
+            if weight > 0 and bypass is None:
                 if turbo_conds is None:
                     turbo_conds = {}
                     for name, conds in original_conds.items():
@@ -133,9 +198,27 @@ class TrajectoryHook:
         )
         # Avoid retaining a second model's worth of patched weights between segments.
         guider.model_patcher.set_hook_mode(comfy.hooks.EnumHookMode.MinVram)
+        patchers = [guider.model_patcher] + guider.model_patcher.get_additional_models_with_key("multigpu")
+        original_injected = []
         try:
+            if bypass is not None:
+                for patcher in patchers:
+                    original_injected.append((patcher, patcher.is_injected))
+                    patcher.eject_model()
+                    patcher.set_injections(MIXER_KEY, [bypass])
+                guider.model_patcher.inject_model()
             return executor(noise, latent_image, sampler, sigmas, *args, **kwargs)
         finally:
+            for patcher, was_injected in reversed(original_injected):
+                bypass.eject(patcher)
+                patcher.eject_model()
+                patcher.remove_injections(MIXER_KEY)
+                if was_injected:
+                    patcher.inject_model()
+            for active in bypass_hooks.values():
+                for hook in active:
+                    hook.release()
+            bypass_hooks.clear()
             guider.model_options = original_options
             guider.model_patcher.set_hook_mode(original_hook_mode)
 

@@ -3,6 +3,7 @@ import importlib.util
 from pathlib import Path
 import sys
 import unittest
+import weakref
 from unittest.mock import patch
 
 import torch
@@ -46,9 +47,10 @@ class TinyDiffusion(torch.nn.Module):
         self.seen = []
 
     def forward(self, x, timestep, context=None, **kwargs):
-        self.seen.append((float(self.proj.weight.mean()), x.shape[0]))
+        effective = self.proj(torch.ones(x.shape[0], 2, device=x.device, dtype=x.dtype) / 2).mean()
+        self.seen.append((float(effective), x.shape[0]))
         guidance = context.mean(dim=(1, 2)).view(-1, *([1] * (x.ndim - 1)))
-        return torch.ones_like(x) * (self.proj.weight.mean() + guidance)
+        return torch.ones_like(x) * (effective + guidance)
 
 
 def tiny_model(model_type=comfy.model_base.ModelType.FLOW):
@@ -78,6 +80,164 @@ def sample(model, sigmas=SIGMAS, sampler_name="euler", positive=POSITIVE, negati
 
 
 class MixerTests(unittest.TestCase):
+    def test_bypass_skips_zero_strength_and_never_merges_turbo_weights(self):
+        base = tiny_model()
+        mixed = mixed_model(base, lora_smooth_steps=4.0)
+        forward = base.model.diffusion_model.proj.forward
+        original_h = mixer.LoRAAdapter.h
+        calls = []
+        copies = []
+        def apply(adapter, x, base_out):
+            calls.append(adapter.multiplier)
+            copies.append(weakref.ref(adapter))
+            return original_h(adapter, x, base_out)
+        def check_weights(step, denoised, x, total):
+            torch.testing.assert_close(base.model.diffusion_model.proj.weight, torch.ones(2, 2), rtol=0, atol=0)
+        with patch.object(mixer.LoRAAdapter, "calculate_weight") as merge:
+            with patch.object(mixer.LoRAAdapter, "h", new=apply):
+                sample(mixed, callback=check_weights)
+                self.assertEqual(len(calls), 9)
+                calls.clear()
+                sample(mixed_model(base))
+                self.assertEqual(calls, [1.0] * 6)
+                calls.clear()
+                sample(mixed_model(base, scheme(prefix_ratio=1, suffix_ratio=1)))
+                self.assertFalse(calls)
+            merge.assert_not_called()
+        self.assertTrue(all(ref() is None for ref in copies))
+        self.assertEqual(base.model.diffusion_model.proj.forward, forward)
+        self.assertFalse(mixed.injections)
+
+    def test_bypass_matches_weight_hooks_with_alpha_negative_strength_and_heun(self):
+        lora = {"diffusion_model.proj.lora_up.weight": torch.tensor([[0.7], [-0.4]]),
+                "diffusion_model.proj.lora_down.weight": torch.tensor([[0.3, -0.2]]),
+                "diffusion_model.proj.alpha": torch.tensor(2.0)}
+        for scale in (-0.75, 0.0, 1.25):
+            for solver in ("euler", "heun", "dpmpp_2m"):
+                with self.subTest(scale=scale, solver=solver):
+                    base = tiny_model()
+                    mixed, _, hooks = comfy.hooks.load_hook_lora_for_models(base, None, lora, scale, 0.0)
+                    mixed = mixer.attach_mixer(mixed, hooks, scheme(), 1.0, 4.0)
+                    bypass, _ = sample(mixed, sampler_name=solver)
+                    with patch.object(mixer, "make_bypass_injection", return_value=(None, {})):
+                        merged, _ = sample(mixed, sampler_name=solver)
+                    torch.testing.assert_close(bypass, merged)
+                    self.assertFalse(mixed.injections)
+
+    def test_dora_and_existing_injections_use_weight_hooks(self):
+        base = tiny_model()
+        dora = LORA | {"diffusion_model.proj.dora_scale": torch.ones(2, 1)}
+        mixed, _, hooks = comfy.hooks.load_hook_lora_for_models(base, None, dora, 1.0, 0.0)
+        mixed = mixer.attach_mixer(mixed, hooks, scheme(), 1.0, 2.0)
+        injection, _ = mixer.make_bypass_injection(mixed, hooks, mixer.StrengthKeyframes())
+        self.assertIsNone(injection)
+        with patch.object(mixer.LoRAAdapter, "h") as bypass:
+            output, _ = sample(mixed)
+            self.assertTrue(torch.isfinite(output).all())
+            bypass.assert_not_called()
+        torch.testing.assert_close(base.model.diffusion_model.proj.weight, torch.ones(2, 2))
+        existing = comfy.patcher_extension.PatcherInjection(lambda patcher: None, lambda patcher: None)
+        base.set_injections("other", [existing])
+        mixed = mixed_model(base, lora_smooth_steps=2.0)
+        sample(mixed)
+        self.assertEqual(mixed.get_injections("other"), [existing])
+        self.assertIsNone(mixed.get_injections(mixer.MIXER_KEY))
+
+    def test_bypass_interruption_releases_adapters_and_restores_forward(self):
+        base = tiny_model()
+        mixed = mixed_model(base, lora_smooth_steps=4.0)
+        forward = base.model.diffusion_model.proj.forward
+        released = []
+        original_release = mixer.ScheduledLoRABypass.release
+        def release(bypass):
+            original_release(bypass)
+            self.assertIs(bypass.adapter.weights, bypass.source_weights)
+            released.append(weakref.ref(bypass.adapter))
+        def interrupt(step, denoised, x, total):
+            if step == 3:
+                raise RuntimeError("bypass interruption")
+        with patch.object(mixer.ScheduledLoRABypass, "release", new=release):
+            with self.assertRaisesRegex(RuntimeError, "bypass interruption"):
+                sample(mixed, callback=interrupt)
+        self.assertTrue(released)
+        self.assertTrue(all(ref() is None for ref in released))
+        self.assertEqual(base.model.diffusion_model.proj.forward, forward)
+        self.assertFalse(mixed.injections)
+        self.assertFalse(mixed.is_injected)
+        again, _ = sample(mixed)
+        self.assertTrue(torch.isfinite(again).all())
+
+    def test_conv_bypass_matches_native_merged_weight_with_stride_and_dilation(self):
+        model = torch.nn.Module()
+        model.conv = torch.nn.Conv2d(3, 4, 3, stride=2, padding=2, dilation=2)
+        patcher = comfy.model_patcher.ModelPatcher(model, torch.device("cpu"), torch.device("cpu"))
+        adapter = mixer.LoRAAdapter(set(), (torch.randn(4, 2, 1, 1), torch.randn(2, 3, 3, 3), 1.5, None, None, None))
+        hook = comfy.hooks.WeightHook()
+        hooks = comfy.hooks.HookGroup()
+        hooks.add(hook)
+        patcher.hook_patches[hook.hook_ref] = {"conv.weight": [(-0.75, adapter, 1.0, None, None)]}
+        strength = mixer.StrengthKeyframes()
+        strength.value = 0.37
+        injection, active = mixer.make_bypass_injection(patcher, hooks, strength)
+        forward = model.conv.forward
+        patcher.set_injections(mixer.MIXER_KEY, [injection])
+        x = torch.randn(2, 3, 17, 19)
+        try:
+            patcher.inject_model()
+            result = model.conv(x)
+            weight = comfy.lora.calculate_weight([(-0.75 * strength.value, adapter, 1.0, None, None)], model.conv.weight.detach().clone(), "conv.weight")
+            expected = torch.nn.functional.conv2d(x, weight, model.conv.bias, stride=2, padding=2, dilation=2)
+            torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
+        finally:
+            patcher.eject_model()
+            patcher.remove_injections(mixer.MIXER_KEY)
+            for bypass in active[patcher]:
+                bypass.release()
+        self.assertEqual(model.conv.forward, forward)
+        model.conv.padding_mode = "reflect"
+        injection, _ = mixer.make_bypass_injection(patcher, hooks, strength)
+        self.assertIsNone(injection)
+
+    def test_partial_bypass_injection_failure_restores_forward(self):
+        base = tiny_model()
+        mixed = mixed_model(base)
+        forward = base.model.diffusion_model.proj.forward
+        original_inject = mixer.ScheduledLoRABypass.inject
+        def fail(bypass):
+            original_inject(bypass)
+            raise RuntimeError("partial injection")
+        with patch.object(mixer.ScheduledLoRABypass, "inject", new=fail):
+            with self.assertRaisesRegex(RuntimeError, "partial injection"):
+                sample(mixed)
+        self.assertEqual(base.model.diffusion_model.proj.forward, forward)
+        self.assertFalse(mixed.injections)
+        self.assertFalse(mixed.is_injected)
+        sample(mixed)
+
+    def test_bypass_injection_uses_each_patchers_model_and_device(self):
+        main = mixed_model(tiny_model())
+        clone = tiny_model()
+        main.set_additional_models("multigpu", [clone])
+        modules = [patcher.model.diffusion_model.proj for patcher in (main, clone)]
+        forwards = [module.forward for module in modules]
+        def run(noise, latent, sampler, sigmas):
+            clone.inject_model()
+            for patcher, module in zip((main, clone), modules):
+                bypass = module.forward.__self__
+                self.assertIsInstance(bypass, mixer.ScheduledLoRABypass)
+                self.assertEqual(bypass.device, patcher.load_device)
+                torch.testing.assert_close(module(torch.ones(1, 2)), torch.full((1, 2), 4.0))
+            raise RuntimeError("multigpu interruption")
+        guider = comfy.samplers.CFGGuider(main)
+        wrapper = main.get_wrappers(comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, mixer.MIXER_KEY)[0]
+        executor = comfy.patcher_extension.WrapperExecutor.new_class_executor(run, guider, [wrapper])
+        with self.assertRaisesRegex(RuntimeError, "multigpu interruption"):
+            executor.execute(None, None, None, SIGMAS)
+        for patcher, module, forward in zip((main, clone), modules, forwards):
+            self.assertEqual(module.forward, forward)
+            self.assertFalse(patcher.injections)
+            self.assertFalse(patcher.is_injected)
+
     def test_four_default_trajectories(self):
         expected = {
             mixer.BASE_BASE: [False] * 3 + [True] * 6 + [False] * 3,
