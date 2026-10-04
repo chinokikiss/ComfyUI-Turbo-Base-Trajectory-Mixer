@@ -119,6 +119,69 @@ Base 与 Turbo LoRA 需要共用兼容的预测类型和采样设置。CLIP 权�
 
 CPU / CUDA 已验证，多 GPU 做过 CPU 模拟验证。ROCm、MPS、DirectML、XPU、NPU 未做硬件验证。第三方量化 patcher、编译模型、跨模型 guider 和跳过 denoiser 的缓存插件未验证；自定义 guider 的独立 guidance 公式仍由该 guider 控制。创建 DynamicVRAM 委托可能增加加载时间和 CPU 内存。
 
+## 实验参考图
+
+以下是 **2026-10-01 相同 phase 的轨迹比较**：Anima Base + Turbo LoRA v0.2，512×512、seed 0、12 步 Euler/simple，Base CFG 4、Turbo CFG 1、LoRA 强度 1。图片来自旧独立采样脚本的硬切换实验，用于参考轨迹顺序与比例；它们不是当前 bypass 或平滑效果的测试图。
+
+图中 `B03-L06-B03` 表示 `Base 3 步 → Turbo 6 步 → Base 3 步`。点击图片可查看原尺寸和每张图的轨迹标签。
+
+### 顺序与比例粗筛
+
+每组包含 14 种轨迹：纯 Base / Turbo，以及不同配比的 `B→L`、`L→B`、`B→L→B`、`L→B→L`。三组提示词合计 42 张。
+
+**森林提灯角色（medium-00）**
+
+![森林提灯角色：14 种 Base 与 Turbo 采样轨迹对比](assets/experiments/trajectory-medium.png)
+
+<details>
+<summary>展开简单与复杂提示词的轨迹对比</summary>
+
+**纯色背景角色（simple-00）**
+
+![纯色背景角色：14 种采样轨迹对比](assets/experiments/trajectory-simple.png)
+
+**双人咖啡馆场景（complex-00）**
+
+![双人咖啡馆场景：14 种采样轨迹对比](assets/experiments/trajectory-complex.png)
+
+</details>
+
+### BLB 比例细化
+
+本轮人工比较选择了 `B→L→B` 作为细化方向。每组图包含纯 B / L、3 组已有 BLB 配比和 6 组新增配比；共生成 18 张新图。最终配比仍由用户按图像审美选择。
+
+<details>
+<summary>展开三组提示词的 BLB 细化对比</summary>
+
+**森林提灯角色（medium-00）**
+
+![森林提灯角色：BLB 比例细化与纯模型对照](assets/experiments/blb-medium.png)
+
+**纯色背景角色（simple-00）**
+
+![纯色背景角色：BLB 比例细化与纯模型对照](assets/experiments/blb-simple.png)
+
+**双人咖啡馆场景（complex-00）**
+
+![双人咖啡馆场景：BLB 比例细化与纯模型对照](assets/experiments/blb-complex.png)
+
+</details>
+
+<details>
+<summary>实验模型与提示词</summary>
+
+模型：`anima_baseV10.safetensors`；Turbo LoRA：`anima-turbo-lora-v0.2.safetensors`；文本编码器：`anima_baseV10_txt.safetensors`；VAE：`qwen_image_vae.safetensors`。
+
+| 提示词组 | Positive prompt |
+|---|---|
+| simple-00 | `1girl, blonde hair, blue eyes, white dress, plain blue background, anime illustration` |
+| medium-00 | `1girl, long blonde hair, fennec ears, blue eyes, holding a lantern in a forest, anime illustration` |
+| complex-00 | `two anime girls at a cafe, blonde girl on the left holding a blue cup, black-haired girl on the right reading a red book, checkerboard floor, rain outside the window` |
+
+统一负面提示词：`worst quality, low quality, blurry, jpeg artifacts`。各配置共用完整 sigma 序列，切换时不重新加噪，也不拟合 phase 映射。
+
+</details>
+
 ## 示例与验证
 
 [Anima BLB API 工作流](examples/anima_blb_api.json)：512×512、seed 0、12 步 Euler/simple、Base CFG 4、Turbo CFG 1、平滑值 0。使用前按本机文件名修改模型选择。
@@ -145,6 +208,8 @@ python custom_nodes/ComfyUI-Turbo-Base-Trajectory-Mixer/tests/test_mixer.py
 已通过 22 项测试，覆盖四种方案、比例与有效区间、EPS / V prediction / flow、Euler / Heun / DPM++ 2M、平滑与 sigma 重访、既有 LoRA / hooks 叠加、bypass 数值对照、卷积、重复执行、异常清理和 V3 节点注册。
 
 ## English
+
+The [reference gallery](#实验参考图) shows the original October 1 trajectory comparisons and BLB ratio refinement. These images came from a separate sampling script with hard switches; they illustrate trajectory choices, not the current bypass or smoothing implementation.
 
 Connect **Turbo / Base Trajectory Mixer** between your model loader and sampler. Select the Turbo LoRA in this node; other style LoRAs can precede it. Use the sampler's CFG for Base and `turbo_cfg` for Turbo. CLIP is unchanged.
 
